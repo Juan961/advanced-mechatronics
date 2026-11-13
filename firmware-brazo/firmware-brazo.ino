@@ -13,6 +13,8 @@
 //   !           -> PARADA (detiene el movimiento y bloquea nuevos comandos)
 //   R           -> rearmar después de una parada
 //   ?           -> reporte de estado
+//   M + vel (-100..100) -> motor DC (banda): % de velocidad, el signo da
+//                          el sentido, M0 lo detiene
 // Respuestas para la interfaz: líneas que empiezan con
 //   OK, ERR, PUNTO, PARADA, ESTADO
 // =========================================================================
@@ -72,6 +74,28 @@ const float ROLL0  = 0.0;       // roll que alinea los dedos con la pieza (phi =
 const float S_ROLL = 1.0;       // -1 si la reorientación sale para el lado contrario
 const unsigned long PAUSA_MS = 500;
 
+// =========================================================================
+// --- MOTOR DC CON PUENTE H BTS7960 (IBT-2) ---
+//   RPWM -> PWM sentido adelante, LPWM -> PWM sentido atrás
+//   R_EN / L_EN -> habilitación (en alto para que el puente funcione)
+//   VCC del módulo a 3.3 V o 5 V del ESP32, GND común con el ESP32
+// =========================================================================
+const uint8_t MOTOR_RPWM = 25;
+const uint8_t MOTOR_LPWM = 26;
+const uint8_t MOTOR_R_EN = 27;
+const uint8_t MOTOR_L_EN = 33;
+const uint32_t MOTOR_PWM_FREQ = 20000;  // Hz (el BTS7960 aguanta hasta 25 kHz; 20 kHz no se escucha)
+const uint8_t  MOTOR_PWM_BITS = 8;      // duty 0..255
+const uint8_t  MOTOR_CANAL_R = 0;       // canales LEDC, solo para core ESP32 2.x
+const uint8_t  MOTOR_CANAL_L = 1;
+const int MOTOR_PWM_MIN = 80;           // duty mínimo con el que el motor arranca
+const unsigned long MOTOR_RAMPA_MS = 10; // ms por cada 1 % de cambio (0->100 % en 1 s)
+const bool DETENER_BANDA_EN_CICLO = true; // parar la banda mientras el brazo toma la pieza
+
+int motorObjetivo = 0;    // % pedido (-100..100)
+int motorActual   = 0;    // % aplicado (va siguiendo la rampa)
+unsigned long motorUltimoPaso = 0;
+
 // --- Estado ---
 bool parada = false;
 unsigned long piezasProcesadas = 0;
@@ -94,12 +118,83 @@ void moveServo(uint8_t channel, int angle) {
   pwm.setPWM(channel, 0, pulse);
 }
 
+// =========================================================================
+// Motor DC
+// =========================================================================
+// Escribe el duty de los dos lados del puente (nunca los dos a la vez)
+void motorEscribirPWM(uint32_t dutyR, uint32_t dutyL) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(MOTOR_RPWM, dutyR);
+  ledcWrite(MOTOR_LPWM, dutyL);
+#else
+  ledcWrite(MOTOR_CANAL_R, dutyR);
+  ledcWrite(MOTOR_CANAL_L, dutyL);
+#endif
+}
+
+void motorIniciar() {
+  pinMode(MOTOR_R_EN, OUTPUT);
+  pinMode(MOTOR_L_EN, OUTPUT);
+  digitalWrite(MOTOR_R_EN, LOW);      // deshabilitado mientras se configura el PWM
+  digitalWrite(MOTOR_L_EN, LOW);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(MOTOR_RPWM, MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+  ledcAttach(MOTOR_LPWM, MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+#else
+  ledcSetup(MOTOR_CANAL_R, MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+  ledcSetup(MOTOR_CANAL_L, MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+  ledcAttachPin(MOTOR_RPWM, MOTOR_CANAL_R);
+  ledcAttachPin(MOTOR_LPWM, MOTOR_CANAL_L);
+#endif
+  motorEscribirPWM(0, 0);
+  digitalWrite(MOTOR_R_EN, HIGH);
+  digitalWrite(MOTOR_L_EN, HIGH);
+}
+
+// Aplica un % (-100..100) directo al puente H
+//   > 0: PWM en RPWM, < 0: PWM en LPWM, 0: los dos en bajo (freno)
+void motorAplicar(int pct) {
+  pct = constrain(pct, -100, 100);
+  if (pct == 0) {
+    motorEscribirPWM(0, 0);
+    return;
+  }
+  uint32_t duty = map(abs(pct), 1, 100, MOTOR_PWM_MIN, (1 << MOTOR_PWM_BITS) - 1);
+  if (pct > 0) motorEscribirPWM(duty, 0);
+  else         motorEscribirPWM(0, duty);
+}
+
+// Avanza la rampa hacia motorObjetivo; se llama seguido, no bloquea
+void actualizarMotor() {
+  if (motorActual == motorObjetivo) return;
+  unsigned long ahora = millis();
+  if (ahora - motorUltimoPaso < MOTOR_RAMPA_MS) return;
+  motorUltimoPaso = ahora;
+  motorActual += (motorObjetivo > motorActual) ? 1 : -1;
+  motorAplicar(motorActual);
+}
+
+// Detiene el motor sin rampa (para la parada de emergencia)
+void motorDetenerYa() {
+  motorObjetivo = 0;
+  motorActual = 0;
+  motorAplicar(0);
+}
+
+// Detiene con rampa y espera a que llegue a 0
+void motorDetenerSuave() {
+  motorObjetivo = 0;
+  while (motorActual != 0) { actualizarMotor(); delay(1); }
+}
+
 // Revisa si llegó un '!' por serial mientras el brazo se mueve
 void revisarParada() {
+  actualizarMotor();
   if (Serial.available() && Serial.peek() == '!') {
     Serial.read();
     parada = true;
     estadoActual = "PARADA";
+    motorDetenerYa();
     Serial.println(F("PARADA"));
   }
 }
@@ -233,6 +328,10 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
     { XD, YD, Z_ALTO, rd, GARRA_ABIERTA }    // 8 sube
   };
 
+  // La pieza tiene que quedarse quieta mientras el brazo la toma
+  int motorAntes = motorObjetivo;
+  if (DETENER_BANDA_EN_CICLO) motorDetenerSuave();
+
   estadoActual = "CICLO";
   for (uint8_t i = 0; i < 8; i++) {
     Serial.print(F("PUNTO ")); Serial.print(i + 1); Serial.println(F("/8"));
@@ -249,6 +348,7 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
   if (parada) return false;
   piezasProcesadas++;
   estadoActual = "REPOSO";
+  if (DETENER_BANDA_EN_CICLO) motorObjetivo = motorAntes;   // reanuda la banda
   Serial.print(F("OK ciclo completo, piezas=")); Serial.println(piezasProcesadas);
   return true;
 }
@@ -264,6 +364,8 @@ void reportarEstado() {
     Serial.print(currentAngles[i]);
     if (i < NUM_SERVOS - 1) Serial.print(',');
   }
+  Serial.print(F(" motor=")); Serial.print(motorActual);
+  Serial.print('/'); Serial.print(motorObjetivo);
   Serial.println();
 }
 
@@ -286,6 +388,7 @@ void handleCommand(String cmd) {
   // Parada y rearme se atienden siempre
   if (letra == '!') {
     parada = true; estadoActual = "PARADA";
+    motorDetenerYa();
     Serial.println(F("PARADA"));
     return;
   }
@@ -332,6 +435,15 @@ void handleCommand(String cmd) {
     return;
   }
 
+  if (letra == 'M') {
+    if (!esEntero(resto)) { Serial.println(F("ERR formato, usar: M -100..100")); return; }
+    int v = resto.toInt();
+    if (v < -100 || v > 100) { Serial.println(F("ERR fuera de -100..100")); return; }
+    motorObjetivo = v;
+    Serial.print(F("OK motor=")); Serial.println(motorObjetivo);
+    return;
+  }
+
   if (letra == '0') {
     moveAll(0);
     Serial.println(F("OK centro"));
@@ -365,6 +477,7 @@ void setup() {
   pwm.setOscillatorFrequency(27000000);
   pwm.setPWMFreq(SERVO_FREQ);
   delay(10);
+  motorIniciar();
 
   for (uint8_t i = 0; i < NUM_SERVOS; i++) moveServo(servoChannels[i], homeAngles[i]);
   delay(1000);
@@ -372,6 +485,7 @@ void setup() {
 }
 
 void loop() {
+  actualizarMotor();
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     handleCommand(cmd);
