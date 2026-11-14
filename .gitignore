@@ -1,0 +1,38 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# ---------- Secretos / configuración local ----------
+.env
+.env.*
+
+# ---------- MATLAB / Simulink ----------
+slprj/
+*.slxc
+*.asv
+*.autosave
+*.slx.r20*
+*.mexw64
+*.mexa64
+*.mexmaci64
+*_ert_rtw/
+*_grt_rtw/
+codegen/
+
+# ---------- Arduino / ESP32 ----------
+build/
+.pio/
+*.elf
+*.bin
+*.hex
+
+# ---------- Editores / sistema ----------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
