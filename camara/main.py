@@ -33,8 +33,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+try:
+    import msvcrt          # Windows: leer teclas de la consola sin bloquear
+except ImportError:
+    msvcrt = None
+
 # ========================= CONFIGURACIÓN =========================
-IP_CAMARA   = "10.213.65.212"                       # la IP que imprime el ESP32-CAM al arrancar
+IP_CAMARA   = "10.12.122.212"                       # la IP que imprime el ESP32-CAM al arrancar
 URL_STREAM  = f"http://{IP_CAMARA}:81/stream"
 URL_CAPTURA = f"http://{IP_CAMARA}/capture"          # respaldo si el stream falla
 ARCHIVO_CAL = Path(__file__).with_name("calibracion_camara.json")   # junto a este script
@@ -74,6 +79,15 @@ class Camara:
         self.cap = cv2.VideoCapture(self.url_stream)
         self.usar_stream = self.cap.isOpened()
         if not self.usar_stream:
+            try:
+                urllib.request.urlopen(self.url_captura, timeout=3).close()
+            except Exception:
+                print(f"\nERROR: no hay respuesta de la cámara en {base_url}")
+                print("  - ¿La ESP32-CAM está encendida y conectada al Wi-Fi? Mira su Monitor")
+                print("    Serie (115200): al arrancar imprime la IP con la que quedó.")
+                print("  - Si la IP cambió, usa --camera <ip> o cambia IP_CAMARA en main.py.")
+                print("  - La PC tiene que estar en la misma red Wi-Fi que la cámara.")
+                raise SystemExit(1)
             print("Stream no disponible, se usará /capture (más lento).")
 
     def leer(self):
@@ -89,6 +103,23 @@ class Camara:
             print("Error leyendo la cámara:", e)
             time.sleep(0.5)
             return None
+
+
+# ----------------------------- Teclado ------------------------------
+def tecla(ms=1):
+    """Tecla presionada en la ventana de OpenCV O en la consola (código en
+    minúscula), o -1 si no hay ninguna. cv2.waitKey solo ve las teclas cuando
+    la ventana de video tiene el foco; así también funcionan desde la consola."""
+    k = cv2.waitKey(ms) & 0xFF
+    if k != 255:
+        return ord(chr(k).lower())
+    while msvcrt is not None and msvcrt.kbhit():
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):      # flechas / teclas de función: 2 códigos
+            msvcrt.getwch()
+            continue
+        return ord(ch.lower())
+    return -1
 
 
 # --------------------------- Calibración ----------------------------
@@ -170,7 +201,7 @@ def pose_pieza(contorno, esquinas, H):
         return None
     cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
     ext, inte = a_mundo(H, np.array(esquinas))
-    phi = math.degrees(math.atan2(inte[1] - ext[1], inte[0] - ext[0]))
+    phi = 0#math.degrees(math.atan2(inte[1] - ext[1], inte[0] - ext[0]))
     return cx, cy, phi
 
 
@@ -194,7 +225,7 @@ def modo_color(ip_camara):
         m = mascara(frame, vals[:3], vals[3:])
         vista = np.hstack([frame, cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)])
         cv2.imshow("Color", vista)
-        k = cv2.waitKey(1) & 0xFF
+        k = tecla(1)
         if k == ord("s"):
             cal["hsv_bajo"], cal["hsv_alto"] = vals[:3], vals[3:]
             guardar_cal(cal)
@@ -373,7 +404,7 @@ def modo_detectar(puerto_serial, ip_camara):
             ultima_impresion = time.time()
 
         cv2.imshow("Deteccion", frame)
-        k = cv2.waitKey(1) & 0xFF
+        k = tecla(1)
         if k == ord("e") and piezas:
             x, y, phi = piezas[0][1]
             linea = f"P {x:.1f},{y:.1f},{phi:.1f}"
@@ -551,7 +582,7 @@ def modo_auto(puerto_serial, ip_camara, vel):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         cv2.imshow("Automatico", frame)
 
-        k = cv2.waitKey(1) & 0xFF
+        k = tecla(1)
         if k == ord("q"):
             break
         elif k == ord("p"):

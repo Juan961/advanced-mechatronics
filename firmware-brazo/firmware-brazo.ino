@@ -15,6 +15,7 @@
 //   ?           -> reporte de estado
 //   M + vel (-100..100) -> motor DC (banda): % de velocidad, el signo da
 //                          el sentido, M0 lo detiene
+//   K + ángulo  -> ángulo de garra cerrada usado en el ciclo (más alto = aprieta más)
 // Respuestas para la interfaz: líneas que empiezan con
 //   OK, ERR, PUNTO, PARADA, ESTADO
 // =========================================================================
@@ -69,7 +70,9 @@ const float Z_TOMA = 30.0;      // altura de la punta al agarrar
 const float Z_DEP  = 35.0;      // altura de la punta al soltar
 const float PITCH_CICLO = -90.0;
 const int   GARRA_ABIERTA = -40;
-const int   GARRA_CERRADA = 0;
+// Cerrada: unos grados MÁS ALLÁ del punto donde los dedos tocan la pieza;
+// esa diferencia es la que da la fuerza de agarre. Se ajusta en vivo con K.
+int garraCerrada = 15;
 const float ROLL0  = 0.0;       // roll que alinea los dedos con la pieza (phi = 0)
 const float S_ROLL = 1.0;       // -1 si la reorientación sale para el lado contrario
 const unsigned long PAUSA_MS = 500;
@@ -320,10 +323,10 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
   Punto ciclo[8] = {
     { xp, yp, Z_ALTO, rt, GARRA_ABIERTA },   // 1 encima de la pieza
     { xp, yp, Z_TOMA, rt, GARRA_ABIERTA },   // 2 baja
-    { xp, yp, Z_TOMA, rt, GARRA_CERRADA },   // 3 agarra
-    { xp, yp, Z_ALTO, rt, GARRA_CERRADA },   // 4 sube
-    { XD, YD, Z_ALTO, rd, GARRA_CERRADA },   // 5 va al lateral y reorienta
-    { XD, YD, Z_DEP,  rd, GARRA_CERRADA },   // 6 baja
+    { xp, yp, Z_TOMA, rt, garraCerrada  },   // 3 agarra
+    { xp, yp, Z_ALTO, rt, garraCerrada  },   // 4 sube
+    { XD, YD, Z_ALTO, rd, garraCerrada  },   // 5 va al lateral y reorienta
+    { XD, YD, Z_DEP,  rd, garraCerrada  },   // 6 baja
     { XD, YD, Z_DEP,  rd, GARRA_ABIERTA },   // 7 suelta
     { XD, YD, Z_ALTO, rd, GARRA_ABIERTA }    // 8 sube
   };
@@ -441,6 +444,18 @@ void handleCommand(String cmd) {
     if (v < -100 || v > 100) { Serial.println(F("ERR fuera de -100..100")); return; }
     motorObjetivo = v;
     Serial.print(F("OK motor=")); Serial.println(motorObjetivo);
+    return;
+  }
+
+  if (letra == 'K') {
+    if (!esEntero(resto)) { Serial.println(F("ERR formato, usar: K angulo")); return; }
+    int g = resto.toInt();
+    if (g <= GARRA_ABIERTA || g > ANGLE_MAX) {
+      Serial.println(F("ERR debe ser mayor que la garra abierta y <= 90"));
+      return;
+    }
+    garraCerrada = g;
+    Serial.print(F("OK garra cerrada=")); Serial.println(garraCerrada);
     return;
   }
 
