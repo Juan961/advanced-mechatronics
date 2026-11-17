@@ -39,7 +39,7 @@ except ImportError:
     msvcrt = None
 
 # ========================= CONFIGURACIÓN =========================
-IP_CAMARA   = "10.12.122.212"                       # la IP que imprime el ESP32-CAM al arrancar
+IP_CAMARA   = "10.126.4.212"                       # la IP que imprime el ESP32-CAM al arrancar
 URL_STREAM  = f"http://{IP_CAMARA}:81/stream"
 URL_CAPTURA = f"http://{IP_CAMARA}/capture"          # respaldo si el stream falla
 ARCHIVO_CAL = Path(__file__).with_name("calibracion_camara.json")   # junto a este script
