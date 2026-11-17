@@ -15,6 +15,8 @@
 //   ?           -> reporte de estado
 //   M + vel (-100..100) -> motor DC (banda): % de velocidad, el signo da
 //                          el sentido, M0 lo detiene
+//   D + duty (-255..255) -> PWM crudo directo al puente H (sin rampa ni
+//                          duty mínimo), para pruebas. D0 lo detiene
 //   K + ángulo  -> ángulo de garra cerrada usado en el ciclo (más alto = aprieta más)
 // Respuestas para la interfaz: líneas que empiezan con
 //   OK, ERR, PUNTO, PARADA, ESTADO
@@ -98,6 +100,7 @@ const bool DETENER_BANDA_EN_CICLO = true; // parar la banda mientras el brazo to
 int motorObjetivo = 0;    // % pedido (-100..100)
 int motorActual   = 0;    // % aplicado (va siguiendo la rampa)
 unsigned long motorUltimoPaso = 0;
+int motorDutyDirecto = 0; // duty crudo del comando D (-255..255), 0 = sin uso
 
 // --- Estado ---
 bool parada = false;
@@ -177,15 +180,29 @@ void actualizarMotor() {
   motorAplicar(motorActual);
 }
 
+// Aplica un duty crudo (-255..255) directo al puente H, sin rampa ni duty mínimo.
+// Cancela la rampa del comando M para que no lo sobrescriba.
+void motorAplicarDutyDirecto(int duty) {
+  duty = constrain(duty, -255, 255);
+  motorObjetivo = 0;
+  motorActual = 0;
+  motorDutyDirecto = duty;
+  if (duty > 0)      motorEscribirPWM(duty, 0);
+  else if (duty < 0) motorEscribirPWM(0, -duty);
+  else               motorEscribirPWM(0, 0);
+}
+
 // Detiene el motor sin rampa (para la parada de emergencia)
 void motorDetenerYa() {
   motorObjetivo = 0;
   motorActual = 0;
+  motorDutyDirecto = 0;
   motorAplicar(0);
 }
 
 // Detiene con rampa y espera a que llegue a 0
 void motorDetenerSuave() {
+  if (motorDutyDirecto != 0) motorAplicarDutyDirecto(0);
   motorObjetivo = 0;
   while (motorActual != 0) { actualizarMotor(); delay(1); }
 }
@@ -369,6 +386,7 @@ void reportarEstado() {
   }
   Serial.print(F(" motor=")); Serial.print(motorActual);
   Serial.print('/'); Serial.print(motorObjetivo);
+  Serial.print(F(" duty=")); Serial.print(motorDutyDirecto);
   Serial.println();
 }
 
@@ -442,8 +460,18 @@ void handleCommand(String cmd) {
     if (!esEntero(resto)) { Serial.println(F("ERR formato, usar: M -100..100")); return; }
     int v = resto.toInt();
     if (v < -100 || v > 100) { Serial.println(F("ERR fuera de -100..100")); return; }
+    if (motorDutyDirecto != 0) motorAplicarDutyDirecto(0);  // sale del modo D
     motorObjetivo = v;
     Serial.print(F("OK motor=")); Serial.println(motorObjetivo);
+    return;
+  }
+
+  if (letra == 'D') {
+    if (!esEntero(resto)) { Serial.println(F("ERR formato, usar: D -255..255")); return; }
+    int d = resto.toInt();
+    if (d < -255 || d > 255) { Serial.println(F("ERR fuera de -255..255")); return; }
+    motorAplicarDutyDirecto(d);
+    Serial.print(F("OK duty=")); Serial.println(motorDutyDirecto);
     return;
   }
 
