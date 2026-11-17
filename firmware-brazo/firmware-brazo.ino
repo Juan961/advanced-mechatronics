@@ -17,7 +17,8 @@
 //                          el sentido, M0 lo detiene
 //   D + duty (-255..255) -> PWM crudo directo al puente H (sin rampa ni
 //                          duty mínimo), para pruebas. D0 lo detiene
-//   K + ángulo  -> ángulo de garra cerrada usado en el ciclo (más alto = aprieta más)
+//   K + ángulo  -> ángulo de garra cerrada usado en el ciclo (misma escala que G;
+//                  abierta = 0, cerrada = -40 por defecto)
 // Respuestas para la interfaz: líneas que empiezan con
 //   OK, ERR, PUNTO, PARADA, ESTADO
 // =========================================================================
@@ -30,7 +31,7 @@ const uint8_t shoulder = 1; // TD8120
 const uint8_t elbow    = 2; // MG996R
 const uint8_t wrist    = 3; // MG90S  (W: roll)
 const uint8_t hand     = 4; // MG90S  (H: pitch)
-const uint8_t gripper  = 5; // MG90S
+const uint8_t gripper  = 15; // MG90S
 
 const uint8_t NUM_SERVOS = 6;
 const uint8_t servoChannels[NUM_SERVOS] = { base, shoulder, elbow, wrist, hand, gripper };
@@ -39,10 +40,19 @@ const char servoLetters[NUM_SERVOS]     = { 'B', 'S', 'E', 'W', 'H', 'G' };
 #define ANGLE_MIN -90
 #define ANGLE_MAX  90
 
-// Pose de arranque (ángulos lógicos). Revisar la garra: en el ciclo
-// abierta = -40 y cerrada = 0.
-const int homeAngles[NUM_SERVOS] = { 0, 0, 0, 0, 0, 90 };
-int currentAngles[NUM_SERVOS]    = { 0, 0, 0, 0, 0, 90 };
+// Sentido de la garra: con true, el ángulo se invierte antes de mandarlo al
+// servo. Los ángulos de la garra (G, K, GARRA_ABIERTA, garraCerrada, home)
+// están todos en la misma escala que el comando G.
+const bool GARRA_INVERTIDA = true;
+// --- Ángulos de la garra (escala del comando G) ---
+const int GARRA_ABIERTA = 0;     // abierta (también al arrancar y en home)
+const int GARRA_HOME    = GARRA_ABIERTA;
+// true: la garra abre/cierra de un solo golpe (sin la rampa de 1° por paso)
+const bool GARRA_DIRECTA = true;
+
+// Pose de arranque (ángulos lógicos)
+const int homeAngles[NUM_SERVOS] = { 0, 45, 0, 0, 0, GARRA_HOME };
+int currentAngles[NUM_SERVOS]    = { 0, 45, 0, 0, 0, GARRA_HOME };
 
 int velocidadMovimiento = 15;   // ms por grado (igual que en la simulación)
 
@@ -66,15 +76,15 @@ const int OFFSET_FISICO_BASE = 20;
 // --- PARÁMETROS DEL CICLO (deben coincidir con el controlador de Simulink) ---
 // Marco del robot, mm y grados
 // =========================================================================
-const float XD = 85.0,  YD = -147.0, PHI_D = -60.0;  // destino en la plantilla
+const float XD = 0,  YD = 200, PHI_D = -60.0;  // destino en la plantilla
 const float Z_ALTO = 100.0;     // altura de tránsito de la punta
-const float Z_TOMA = 30.0;      // altura de la punta al agarrar
-const float Z_DEP  = 35.0;      // altura de la punta al soltar
+const float Z_APROX_MIN = 70.0; // altura mínima sobre la pieza si está lejos (ver ejecutarCiclo)
+const float Z_TOMA = 50.0;      // altura de la punta al agarrar
+const float Z_DEP  = 40.0;      // altura de la punta al soltar
 const float PITCH_CICLO = -90.0;
-const int   GARRA_ABIERTA = -40;
-// Cerrada: unos grados MÁS ALLÁ del punto donde los dedos tocan la pieza;
-// esa diferencia es la que da la fuerza de agarre. Se ajusta en vivo con K.
-int garraCerrada = 15;
+// Garra cerrada (escala del comando G). Se ajusta en vivo con K.
+int garraCerrada = 60;
+const bool  USAR_ROLL = false;  // false: el ciclo no gira la muñeca (roll = 0 al tomar y al soltar)
 const float ROLL0  = 0.0;       // roll que alinea los dedos con la pieza (phi = 0)
 const float S_ROLL = 1.0;       // -1 si la reorientación sale para el lado contrario
 const unsigned long PAUSA_MS = 500;
@@ -96,6 +106,7 @@ const uint8_t  MOTOR_CANAL_L = 1;
 const int MOTOR_PWM_MIN = 80;           // duty mínimo con el que el motor arranca
 const unsigned long MOTOR_RAMPA_MS = 10; // ms por cada 1 % de cambio (0->100 % en 1 s)
 const bool DETENER_BANDA_EN_CICLO = true; // parar la banda mientras el brazo toma la pieza
+const bool FRENAR_SIN_RAMPA = true;       // M0 detiene al instante (freno del puente H)
 
 int motorObjetivo = 0;    // % pedido (-100..100)
 int motorActual   = 0;    // % aplicado (va siguiendo la rampa)
@@ -112,6 +123,7 @@ const char* estadoActual = "REPOSO";
 // =========================================================================
 void moveServo(uint8_t channel, int angle) {
   if (channel == base) angle += OFFSET_FISICO_BASE;
+  if (channel == gripper && GARRA_INVERTIDA) angle = -angle;
   angle = constrain(angle, ANGLE_MIN, ANGLE_MAX);
 
   unsigned int us;
@@ -228,8 +240,15 @@ void esperar(unsigned long ms) {
   }
 }
 
-// 1 grado por paso en cada eje, todos a la vez
+// 1 grado por paso en cada eje, todos a la vez.
+// La garra (con GARRA_DIRECTA) no se escalona: va a su objetivo en un solo
+// movimiento, al inicio; el resto de los ejes sigue con la rampa.
 void moverSuavemente(const int objetivos[NUM_SERVOS]) {
+  const uint8_t G = NUM_SERVOS - 1;   // índice de la garra
+  if (GARRA_DIRECTA && currentAngles[G] != objetivos[G] && !parada) {
+    currentAngles[G] = objetivos[G];
+    moveServo(servoChannels[G], currentAngles[G]);
+  }
   bool moviendose = true;
   while (moviendose && !parada) {
     moviendose = false;
@@ -264,6 +283,8 @@ float envolver(float a) {            // lleva un ángulo a (-180, 180]
 // =========================================================================
 // Cinemática inversa (misma que en la simulación)
 // =========================================================================
+bool ikSilencioso = false;   // true: calcularIK no imprime los ERR (para probar alturas)
+
 bool calcularIK(float x, float y, float z, float pitch, float roll, int garra,
                 int objetivos[NUM_SERVOS]) {
   float pr = pitch * PI / 180.0;
@@ -275,7 +296,7 @@ bool calcularIK(float x, float y, float z, float pitch, float roll, int garra,
   float D = sqrt(r_muneca * r_muneca + z_rel * z_rel);
 
   if (D > (L1 + L2) || D < fabs(L1 - L2)) {
-    Serial.println(F("ERR coordenada inalcanzable"));
+    if (!ikSilencioso) Serial.println(F("ERR coordenada inalcanzable"));
     return false;
   }
 
@@ -292,6 +313,7 @@ bool calcularIK(float x, float y, float z, float pitch, float roll, int garra,
   const char* nombres[5] = { "Base", "Hombro", "Codo", "Roll(W)", "Pitch(H)" };
   for (uint8_t i = 0; i < 5; i++) {
     if (calc[i] < ANGLE_MIN || calc[i] > ANGLE_MAX) {
+      if (ikSilencioso) return false;
       Serial.print(F("ERR fuera de rango: "));
       Serial.print(nombres[i]);
       Serial.print(F(" = "));
@@ -324,7 +346,8 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
 
   // Pinza simétrica: tomar la pieza con la muñeca girada 180° es el mismo agarre
   float rt = 0, rd = 0;
-  bool ok = false;
+  bool ok = !USAR_ROLL;          // sin roll: la muñeca queda en 0 todo el ciclo
+  if (!USAR_ROLL) giro = 0;
   const float opciones[3] = { 0.0, -180.0, 180.0 };
   for (uint8_t k = 0; k < 3 && !ok; k++) {
     float cand = envolver(phi_p + ROLL0 + opciones[k]);
@@ -337,11 +360,29 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
     return false;
   }
 
+  // Altura de aproximación sobre la pieza: Z_ALTO si alcanza; si la pieza está
+  // lejos (con pitch -90 a 100 mm solo llega a ~213 mm), se baja de a 5 mm
+  // hasta Z_APROX_MIN (a 70 mm llega a ~239 mm, a 50 mm a ~250 mm).
+  float zAprox = Z_ALTO;
+  {
+    int tmp[NUM_SERVOS];
+    ikSilencioso = true;
+    while (zAprox > Z_APROX_MIN &&
+           !calcularIK(xp, yp, zAprox, PITCH_CICLO, rt, GARRA_ABIERTA, tmp)) {
+      zAprox -= 5.0;
+    }
+    if (zAprox < Z_APROX_MIN) zAprox = Z_APROX_MIN;
+    ikSilencioso = false;
+  }
+  if (zAprox < Z_ALTO) {
+    Serial.print(F("OK pieza lejos, aproximacion a z=")); Serial.println(zAprox);
+  }
+
   Punto ciclo[8] = {
-    { xp, yp, Z_ALTO, rt, GARRA_ABIERTA },   // 1 encima de la pieza
+    { xp, yp, zAprox, rt, GARRA_ABIERTA },   // 1 encima de la pieza
     { xp, yp, Z_TOMA, rt, GARRA_ABIERTA },   // 2 baja
     { xp, yp, Z_TOMA, rt, garraCerrada  },   // 3 agarra
-    { xp, yp, Z_ALTO, rt, garraCerrada  },   // 4 sube
+    { xp, yp, zAprox, rt, garraCerrada  },   // 4 sube
     { XD, YD, Z_ALTO, rd, garraCerrada  },   // 5 va al lateral y reorienta
     { XD, YD, Z_DEP,  rd, garraCerrada  },   // 6 baja
     { XD, YD, Z_DEP,  rd, GARRA_ABIERTA },   // 7 suelta
@@ -461,6 +502,13 @@ void handleCommand(String cmd) {
     int v = resto.toInt();
     if (v < -100 || v > 100) { Serial.println(F("ERR fuera de -100..100")); return; }
     if (motorDutyDirecto != 0) motorAplicarDutyDirecto(0);  // sale del modo D
+    // M0 frena al instante (sin rampa): la cámara lo manda al ver una pieza y
+    // cada ms de más la saca del encuadre. La rampa queda solo para acelerar.
+    if (v == 0 && FRENAR_SIN_RAMPA) {
+      motorDetenerYa();
+      Serial.println(F("OK motor=0"));
+      return;
+    }
     motorObjetivo = v;
     Serial.print(F("OK motor=")); Serial.println(motorObjetivo);
     return;
@@ -478,8 +526,8 @@ void handleCommand(String cmd) {
   if (letra == 'K') {
     if (!esEntero(resto)) { Serial.println(F("ERR formato, usar: K angulo")); return; }
     int g = resto.toInt();
-    if (g <= GARRA_ABIERTA || g > ANGLE_MAX) {
-      Serial.println(F("ERR debe ser mayor que la garra abierta y <= 90"));
+    if (g == GARRA_ABIERTA || g < ANGLE_MIN || g > ANGLE_MAX) {
+      Serial.println(F("ERR debe estar en -90..90 y ser distinto de la garra abierta"));
       return;
     }
     garraCerrada = g;

@@ -26,6 +26,7 @@ Es único para cualquier orientación de 0 a 360°.
 import argparse
 import json
 import math
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -39,7 +40,7 @@ except ImportError:
     msvcrt = None
 
 # ========================= CONFIGURACIÓN =========================
-IP_CAMARA   = "10.126.4.212"                       # la IP que imprime el ESP32-CAM al arrancar
+IP_CAMARA   = "10.12.122.212"                       # la IP que imprime el ESP32-CAM al arrancar
 URL_STREAM  = f"http://{IP_CAMARA}:81/stream"
 URL_CAPTURA = f"http://{IP_CAMARA}/capture"          # respaldo si el stream falla
 ARCHIVO_CAL = Path(__file__).with_name("calibracion_camara.json")   # junto a este script
@@ -49,16 +50,18 @@ HSV_ALTO    = [179, 50, 255]
 
 # --- Modo automático (banda + brazo) ---
 BAUDIOS        = 115200
-VEL_BANDA      = 50          # [%] velocidad de la banda (comando M), el signo da el sentido
+VEL_BANDA      = 10          # [%] velocidad de la banda (comando M), el signo da el sentido
+                             #     duty real = 80 + (VEL-1)*175/99  ->  30 % ≈ 131/255
 # Zona donde se toman las piezas, en mm en el marco del robot:
-# (x_min, x_max, y_min, y_max). Debe quedar dentro del alcance del brazo.
+# (x_min, x_max, y_min, y_max). Debe pquedar dentro del alcance del brazo.
 # None = cualquier lugar de la imagen.
 ZONA_TOMA      = None
-# Alcance del brazo con pitch -90 y Z_ALTO = 100 (calculado con la IK del
-# firmware: 47..213 mm). Se deja margen para que la pieza no quede al límite.
+# Alcance del brazo con pitch -90 (IK del firmware). La aproximación sobre la
+# pieza baja de Z_ALTO = 100 hasta Z_APROX_MIN = 70 si hace falta, y a 70 mm
+# llega hasta 239 mm. Se deja margen para que la pieza no quede al límite.
 ALCANCE_MIN    = 60.0        # [mm] distancia mínima del centro de la base
-ALCANCE_MAX    = 205.0       # [mm] distancia máxima para frenar la banda
-MARGEN_MEDIR   = 8.0         # [mm] al medir se acepta hasta ALCANCE_MAX + esto (límite real 213)
+ALCANCE_MAX    = 232.0       # [mm] distancia máxima para frenar la banda
+MARGEN_MEDIR   = 6.0         # [mm] al medir se acepta hasta ALCANCE_MAX + esto (límite real 239)
 DESTINO_XY     = (85.0, -147.0)   # igual que XD, YD del firmware
 RADIO_DESTINO  = 70.0        # [mm] se ignoran piezas cerca del destino (las ya colocadas)
 ESPERA_FRENADO = 0.8         # [s] después de M0, antes de empezar a medir
@@ -72,12 +75,24 @@ TIMEOUT_CICLO  = 90.0        # [s] si el brazo no responde -> error
 
 # ------------------------------ Cámara ------------------------------
 class Camara:
+    """Lee el stream en un hilo aparte y se queda SOLO con el último cuadro.
+    Sin esto, OpenCV acumula cuadros en un buffer y, como el procesamiento es
+    más lento que el stream, se trabaja con imágenes de 1-2 s de atraso: la
+    banda se frena cuando la pieza ya se salió del encuadre."""
+
     def __init__(self, ip_camara=IP_CAMARA):
         base_url = f"http://{ip_camara.strip().rstrip('/') }"
         self.url_stream = f"{base_url}:81/stream"
         self.url_captura = f"{base_url}/capture"
         self.cap = cv2.VideoCapture(self.url_stream)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.usar_stream = self.cap.isOpened()
+        self._frame = None
+        self._id = 0            # contador de cuadros recibidos
+        self._id_leido = 0      # último cuadro entregado por leer()
+        self._cond = threading.Condition()
+        if self.usar_stream:
+            threading.Thread(target=self._hilo_stream, daemon=True).start()
         if not self.usar_stream:
             try:
                 urllib.request.urlopen(self.url_captura, timeout=3).close()
@@ -90,11 +105,33 @@ class Camara:
                 raise SystemExit(1)
             print("Stream no disponible, se usará /capture (más lento).")
 
-    def leer(self):
-        if self.usar_stream:
+    def _hilo_stream(self):
+        fallos = 0
+        while self.usar_stream:
             ok, frame = self.cap.read()
-            if ok:
-                return frame
+            if not ok:
+                fallos += 1
+                if fallos > 50:
+                    print("Stream perdido, se usará /capture (más lento).")
+                    self.usar_stream = False
+                time.sleep(0.02)
+                continue
+            fallos = 0
+            with self._cond:
+                self._frame = frame
+                self._id += 1
+                self._cond.notify_all()
+
+    def leer(self):
+        """Devuelve el cuadro más reciente que todavía no se haya entregado
+        (espera hasta 1 s a que llegue uno nuevo)."""
+        if self.usar_stream:
+            with self._cond:
+                self._cond.wait_for(lambda: self._id != self._id_leido, timeout=1.0)
+                if self._id != self._id_leido:
+                    self._id_leido = self._id
+                    return self._frame
+            return None
         try:
             with urllib.request.urlopen(self.url_captura, timeout=3) as r:
                 datos = np.frombuffer(r.read(), np.uint8)
@@ -436,6 +473,18 @@ def en_zona(x, y, margen=0.0):
     return x0 <= x <= x1 and y0 <= y <= y1
 
 
+def motivo_zona(x, y):
+    """Por qué en_zona() rechaza una pieza (texto corto para la pantalla)."""
+    if math.hypot(x - DESTINO_XY[0], y - DESTINO_XY[1]) < RADIO_DESTINO:
+        return "en destino"
+    d = math.hypot(x, y)
+    if d > ALCANCE_MAX:
+        return f"lejos d={d:.0f}>{ALCANCE_MAX:.0f}"
+    if d < ALCANCE_MIN:
+        return f"cerca d={d:.0f}<{ALCANCE_MIN:.0f}"
+    return "fuera de ZONA_TOMA"
+
+
 def dispersion(lecturas):
     """Máxima distancia [mm] y máxima diferencia de ángulo [°] respecto al promedio."""
     xm, ym, pm = pose_promedio(lecturas)
@@ -514,6 +563,8 @@ def modo_auto(puerto_serial, ip_camara, vel):
     estado, t_estado = "BANDA", time.time()
     lecturas = []
     ultima_vista = None
+    pose_disparo = (0.0, 0.0, 0.0)
+    ultimo_aviso = 0.0
     piezas_ok = 0
 
     def cambiar(nuevo):
@@ -540,9 +591,21 @@ def modo_auto(puerto_serial, ip_camara, vel):
         dibujar_zonas(frame, Hinv)
         dt = time.time() - t_estado
 
+        # Diagnóstico: piezas en L vistas pero descartadas por la zona
+        for _, (x, y, _) in todas:
+            if not en_zona(x, y):
+                u, v = a_mundo(Hinv, [(x, y)])[0].astype(int)
+                cv2.putText(frame, motivo_zona(x, y), (int(u) - 40, int(v) + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 2)
+        if estado == "BANDA" and todas and not piezas and time.time() - ultimo_aviso > 1.0:
+            x, y, _ = todas[0][1]
+            print(f"    pieza vista pero descartada ({motivo_zona(x, y)}): x={x:.0f} y={y:.0f}")
+            ultimo_aviso = time.time()
+
         if estado == "BANDA":
             if piezas:                              # apareció una pieza: parar la banda
                 robot.enviar("M0")
+                pose_disparo = piezas[0][1]
                 lecturas = []
                 ultima_vista = None
                 cambiar("FRENANDO")
@@ -560,6 +623,8 @@ def modo_auto(puerto_serial, ip_camara, vel):
                 lecturas = (lecturas + [piezas_med[0][1]])[-N_ESTABLE:]
             if len(lecturas) == N_ESTABLE and pose_estable(lecturas):
                 x, y, phi = pose_promedio(lecturas)
+                print(f"    recorrido después de M0: "
+                      f"{math.hypot(x - pose_disparo[0], y - pose_disparo[1]):.0f} mm")
                 robot.enviar(f"P {x:.1f},{y:.1f},{phi:.1f}")
                 cambiar("CICLO")
             elif dt > TIMEOUT_MEDIR:
