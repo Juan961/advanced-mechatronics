@@ -86,7 +86,7 @@ const int BASE_FISICO_MAX = 100;
 //   ANG_D: giro de la base al soltar (+ = izquierda). Máximo 70 por el
 //          offset de la base (ver BASE_FISICO_MAX).
 //   R_D:   distancia desde el centro de la base [mm]
-const float R_D = 200.0, ANG_D = 70.0;
+const float R_D = 240.0, ANG_D = 70.0;   // R_D más grande = suelta más lejos de la banda
 const float XD = R_D * cos(ANG_D * PI / 180.0);
 const float YD = R_D * sin(ANG_D * PI / 180.0);
 const float PHI_D = -60.0;      // orientación en la plantilla (solo si USAR_ROLL)
@@ -94,7 +94,12 @@ const float Z_ALTO = 100.0;     // altura de tránsito de la punta
 const float Z_APROX_MIN = 70.0; // altura mínima sobre la pieza si está lejos (ver ejecutarCiclo)
 float zToma = 70.0;             // altura de la punta al agarrar (se ajusta en vivo con Z; más alto = baja menos)
 const float Z_DEP  = 60.0;      // altura de la punta al soltar (más alto = suelta desde más arriba)
-const float PITCH_CICLO = -90.0;
+const float PITCH_CICLO = -90.0;   // garra vertical para agarrar y soltar
+// Tránsito con la pieza: más alto, con la garra algo inclinada (con -90 el
+// brazo no pasa de ~120 mm; con -60 llega a 160 mm entre 66 y 269 mm de la base).
+// Si la pieza se resbala por la inclinación, acercar PITCH_TRANS a -90 (y bajar Z_TRANS).
+const float Z_TRANS = 160.0;
+const float PITCH_TRANS = -60.0;
 // Garra cerrada (escala del comando G). Se ajusta en vivo con K.
 int garraCerrada = 80;
 const bool  USAR_ROLL = false;  // false: el ciclo no gira la muñeca (roll = 0 al tomar y al soltar)
@@ -360,7 +365,19 @@ bool moverA(float x, float y, float z, float pitch, float roll, int garra) {
 // =========================================================================
 // Ciclo pick and place a partir de la pose de la pieza
 // =========================================================================
-struct Punto { float x, y, z, roll; int garra; };
+struct Punto { float x, y, z, pitch, roll; int garra; };
+
+// La z más alta entre zMin y zMax (bajando de a 5 mm) a la que la IK llega en
+// (x, y) con ese pitch. Si ninguna alcanza, devuelve zMin.
+float alturaAlcanzable(float x, float y, float zMax, float zMin, float pitch, float roll) {
+  int tmp[NUM_SERVOS];
+  bool antes = ikSilencioso;
+  ikSilencioso = true;
+  float z = zMax;
+  while (z > zMin && !calcularIK(x, y, z, pitch, roll, GARRA_ABIERTA, tmp)) z -= 5.0;
+  ikSilencioso = antes;
+  return max(z, zMin);
+}
 
 bool ejecutarCiclo(float xp, float yp, float phi_p) {
   // Reorientación: lo que pide la plantilla menos lo que ya gira la base
@@ -402,36 +419,49 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
     Serial.print(F("OK pieza lejos, aproximacion a z=")); Serial.println(zAprox);
   }
 
-  Punto ciclo[8] = {
-    { xp, yp, zAprox, rt, GARRA_ABIERTA },   // 1 encima de la pieza
-    { xp, yp, zToma , rt, GARRA_ABIERTA },   // 2 baja
-    { xp, yp, zToma , rt, garraCerrada  },   // 3 agarra
-    { xp, yp, zAprox, rt, garraCerrada  },   // 4 sube
-    { XD, YD, Z_ALTO, rd, garraCerrada  },   // 5 va al lateral y reorienta
-    { XD, YD, Z_DEP,  rd, garraCerrada  },   // 6 baja
-    { XD, YD, Z_DEP,  rd, GARRA_ABIERTA },   // 7 suelta
-    { XD, YD, Z_ALTO, rd, GARRA_ABIERTA }    // 8 sube
+  // Altura de tránsito (con la pieza en la garra): lo más alto posible hasta
+  // Z_TRANS, con la garra inclinada PITCH_TRANS. Si no alcanza (pieza muy
+  // cerca o muy lejos de la base), se baja de a 5 mm hasta zAprox.
+  float zTransT = alturaAlcanzable(xp, yp, Z_TRANS, zAprox, PITCH_TRANS, rt);
+  float zTransD = alturaAlcanzable(XD, YD, Z_TRANS, Z_DEP + 20.0f, PITCH_TRANS, rd);
+  float zTrans  = min(zTransT, zTransD);   // la misma altura en los dos extremos del giro
+
+  const uint8_t N = 9;
+  Punto ciclo[N] = {
+    { xp, yp, zAprox, PITCH_CICLO, rt, GARRA_ABIERTA },   // 1 encima de la pieza
+    { xp, yp, zToma,  PITCH_CICLO, rt, GARRA_ABIERTA },   // 2 baja
+    { xp, yp, zToma,  PITCH_CICLO, rt, garraCerrada  },   // 3 agarra
+    { xp, yp, zAprox, PITCH_CICLO, rt, garraCerrada  },   // 4 sube vertical (despega de la banda)
+    { xp, yp, zTrans, PITCH_TRANS, rt, garraCerrada  },   // 5 sube a la altura de tránsito
+    { XD, YD, zTrans, PITCH_TRANS, rd, garraCerrada  },   // 6 gira al destino, en alto
+    { XD, YD, Z_DEP,  PITCH_CICLO, rd, garraCerrada  },   // 7 baja vertical
+    { XD, YD, Z_DEP,  PITCH_CICLO, rd, GARRA_ABIERTA },   // 8 suelta
+    { XD, YD, zTrans, PITCH_TRANS, rd, GARRA_ABIERTA }    // 9 sube
   };
 
-  // La pieza tiene que quedarse quieta mientras el brazo la toma
-  // Antes de tomar la pieza, comprobar que el destino es alcanzable (si no,
+  // Antes de tomar la pieza, comprobar que TODO el ciclo es alcanzable (si no,
   // el brazo quedaría con la pieza en la garra a mitad del ciclo)
   {
     int tmp[NUM_SERVOS];
-    if (!calcularIK(XD, YD, Z_ALTO, PITCH_CICLO, rd, garraCerrada, tmp) ||
-        !calcularIK(XD, YD, Z_DEP,  PITCH_CICLO, rd, garraCerrada, tmp)) {
-      Serial.println(F("ERR destino inalcanzable, revisar R_D / ANG_D / Z_DEP"));
-      return false;
+    for (uint8_t i = 0; i < N; i++) {
+      if (!calcularIK(ciclo[i].x, ciclo[i].y, ciclo[i].z, ciclo[i].pitch,
+                      ciclo[i].roll, ciclo[i].garra, tmp)) {
+        Serial.print(F("ERR punto ")); Serial.print(i + 1);
+        Serial.println(F(" inalcanzable, revisar R_D / ANG_D / Z_DEP / Z_TRANS"));
+        return false;
+      }
     }
   }
+  Serial.print(F("OK transito a z=")); Serial.println(zTrans);
 
+  // La pieza tiene que quedarse quieta mientras el brazo la toma
   int motorAntes = motorObjetivo;
   if (DETENER_BANDA_EN_CICLO) motorDetenerSuave();
 
   estadoActual = "CICLO";
-  for (uint8_t i = 0; i < 8; i++) {
-    Serial.print(F("PUNTO ")); Serial.print(i + 1); Serial.println(F("/8"));
-    if (!moverA(ciclo[i].x, ciclo[i].y, ciclo[i].z, PITCH_CICLO, ciclo[i].roll, ciclo[i].garra)) {
+  for (uint8_t i = 0; i < N; i++) {
+    Serial.print(F("PUNTO ")); Serial.print(i + 1); Serial.print('/'); Serial.println(N);
+    if (!moverA(ciclo[i].x, ciclo[i].y, ciclo[i].z, ciclo[i].pitch, ciclo[i].roll, ciclo[i].garra)) {
       if (!parada) Serial.println(F("ERR ciclo abortado"));
       estadoActual = parada ? "PARADA" : "REPOSO";
       return false;

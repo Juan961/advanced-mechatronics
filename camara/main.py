@@ -64,9 +64,9 @@ ZONA_TOMA      = None
 # pieza baja de Z_ALTO = 100 hasta Z_APROX_MIN = 70 si hace falta, y a 70 mm
 # llega hasta 239 mm. Se deja margen para que la pieza no quede al límite.
 ALCANCE_MIN    = 60.0        # [mm] distancia mínima del centro de la base
-ALCANCE_MAX    = 232.0       # [mm] distancia máxima para frenar la banda
-MARGEN_MEDIR   = 6.0         # [mm] al medir se acepta hasta ALCANCE_MAX + esto (límite real 239)
-DESTINO_XY     = (68.4, 187.9)    # igual que XD, YD del firmware (R_D=200, ANG_D=70)
+ALCANCE_MAX    = 217.0       # [mm] distancia máxima para frenar la banda (con zToma=70 la aproximación queda a z>=90)
+MARGEN_MEDIR   = 5.0         # [mm] al medir se acepta hasta ALCANCE_MAX + esto (límite real 223 con z=90)
+DESTINO_XY     = (82.1, 225.5)    # igual que XD, YD del firmware (R_D=240, ANG_D=70)
 RADIO_DESTINO  = 70.0        # [mm] se ignoran piezas cerca del destino (las ya colocadas)
 ESPERA_FRENADO = 0.8         # [s] después de M0, antes de empezar a medir
 N_ESTABLE      = 5           # lecturas seguidas casi iguales para aceptar la pose
