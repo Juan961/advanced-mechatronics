@@ -19,6 +19,7 @@
 //                          duty mínimo), para pruebas. D0 lo detiene
 //   K + ángulo  -> ángulo de garra cerrada usado en el ciclo (misma escala que G;
 //                  abierta = 0, cerrada = -40 por defecto)
+//   Z + mm      -> altura de la punta al agarrar en el ciclo (más alto = baja menos)
 // Respuestas para la interfaz: líneas que empiezan con
 //   OK, ERR, PUNTO, PARADA, ESTADO
 // =========================================================================
@@ -70,20 +71,32 @@ const float L3 = 110.0;
 const float OFFSET_Q0 = 0.0;
 const float OFFSET_Q1 = 90.0;
 const float OFFSET_Q2 = 90.0;
-const int OFFSET_FISICO_BASE = 20;
+const int OFFSET_FISICO_BASE = 30;   // ángulo que hay que sumarle al servo para que la base quede derecha (x del robot)
+// Ángulo máximo que se le manda al servo de la base (después de sumar el
+// offset). 100 -> pulsos de 500..2500 us, el rango completo del MG996R.
+// Con el offset de +30, la base llega hasta 70° lógicos hacia la izquierda.
+// Si el servo zumba o se traba en el extremo, bajarlo a 95.
+const int BASE_FISICO_MAX = 100;
 
 // =========================================================================
 // --- PARÁMETROS DEL CICLO (deben coincidir con el controlador de Simulink) ---
 // Marco del robot, mm y grados
 // =========================================================================
-const float XD = 0,  YD = 200, PHI_D = -60.0;  // destino en la plantilla
+// Destino (donde se suelta la pieza), en polar alrededor de la base:
+//   ANG_D: giro de la base al soltar (+ = izquierda). Máximo 70 por el
+//          offset de la base (ver BASE_FISICO_MAX).
+//   R_D:   distancia desde el centro de la base [mm]
+const float R_D = 200.0, ANG_D = 70.0;
+const float XD = R_D * cos(ANG_D * PI / 180.0);
+const float YD = R_D * sin(ANG_D * PI / 180.0);
+const float PHI_D = -60.0;      // orientación en la plantilla (solo si USAR_ROLL)
 const float Z_ALTO = 100.0;     // altura de tránsito de la punta
 const float Z_APROX_MIN = 70.0; // altura mínima sobre la pieza si está lejos (ver ejecutarCiclo)
-const float Z_TOMA = 50.0;      // altura de la punta al agarrar
-const float Z_DEP  = 40.0;      // altura de la punta al soltar
+float zToma = 70.0;             // altura de la punta al agarrar (se ajusta en vivo con Z; más alto = baja menos)
+const float Z_DEP  = 60.0;      // altura de la punta al soltar (más alto = suelta desde más arriba)
 const float PITCH_CICLO = -90.0;
 // Garra cerrada (escala del comando G). Se ajusta en vivo con K.
-int garraCerrada = 60;
+int garraCerrada = 80;
 const bool  USAR_ROLL = false;  // false: el ciclo no gira la muñeca (roll = 0 al tomar y al soltar)
 const float ROLL0  = 0.0;       // roll que alinea los dedos con la pieza (phi = 0)
 const float S_ROLL = 1.0;       // -1 si la reorientación sale para el lado contrario
@@ -122,9 +135,13 @@ const char* estadoActual = "REPOSO";
 // Bajo nivel
 // =========================================================================
 void moveServo(uint8_t channel, int angle) {
-  if (channel == base) angle += OFFSET_FISICO_BASE;
-  if (channel == gripper && GARRA_INVERTIDA) angle = -angle;
-  angle = constrain(angle, ANGLE_MIN, ANGLE_MAX);
+  if (channel == base) {
+    angle += OFFSET_FISICO_BASE;
+    angle = constrain(angle, -BASE_FISICO_MAX, BASE_FISICO_MAX);
+  } else {
+    if (channel == gripper && GARRA_INVERTIDA) angle = -angle;
+    angle = constrain(angle, ANGLE_MIN, ANGLE_MAX);
+  }
 
   unsigned int us;
   if (channel == base || channel == elbow) {
@@ -312,7 +329,14 @@ bool calcularIK(float x, float y, float z, float pitch, float roll, int garra,
   float calc[5] = { q0d - OFFSET_Q0, q1d - OFFSET_Q1, q2d - OFFSET_Q2, roll, q3d };
   const char* nombres[5] = { "Base", "Hombro", "Codo", "Roll(W)", "Pitch(H)" };
   for (uint8_t i = 0; i < 5; i++) {
-    if (calc[i] < ANGLE_MIN || calc[i] > ANGLE_MAX) {
+    // La base se revisa con su offset y su rango propio: antes se recortaba
+    // en silencio y la base se quedaba corta sin avisar.
+    float minimo = ANGLE_MIN, maximo = ANGLE_MAX;
+    if (i == 0) {
+      minimo = -BASE_FISICO_MAX - OFFSET_FISICO_BASE - 0.5;  // 0.5: redondeo de float
+      maximo =  BASE_FISICO_MAX - OFFSET_FISICO_BASE + 0.5;
+    }
+    if (calc[i] < minimo || calc[i] > maximo) {
       if (ikSilencioso) return false;
       Serial.print(F("ERR fuera de rango: "));
       Serial.print(nombres[i]);
@@ -367,11 +391,11 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
   {
     int tmp[NUM_SERVOS];
     ikSilencioso = true;
-    while (zAprox > Z_APROX_MIN &&
+    while (zAprox > max(Z_APROX_MIN, zToma + 20.0f) &&
            !calcularIK(xp, yp, zAprox, PITCH_CICLO, rt, GARRA_ABIERTA, tmp)) {
       zAprox -= 5.0;
     }
-    if (zAprox < Z_APROX_MIN) zAprox = Z_APROX_MIN;
+    if (zAprox < max(Z_APROX_MIN, zToma + 20.0f)) zAprox = max(Z_APROX_MIN, zToma + 20.0f);
     ikSilencioso = false;
   }
   if (zAprox < Z_ALTO) {
@@ -380,8 +404,8 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
 
   Punto ciclo[8] = {
     { xp, yp, zAprox, rt, GARRA_ABIERTA },   // 1 encima de la pieza
-    { xp, yp, Z_TOMA, rt, GARRA_ABIERTA },   // 2 baja
-    { xp, yp, Z_TOMA, rt, garraCerrada  },   // 3 agarra
+    { xp, yp, zToma , rt, GARRA_ABIERTA },   // 2 baja
+    { xp, yp, zToma , rt, garraCerrada  },   // 3 agarra
     { xp, yp, zAprox, rt, garraCerrada  },   // 4 sube
     { XD, YD, Z_ALTO, rd, garraCerrada  },   // 5 va al lateral y reorienta
     { XD, YD, Z_DEP,  rd, garraCerrada  },   // 6 baja
@@ -390,6 +414,17 @@ bool ejecutarCiclo(float xp, float yp, float phi_p) {
   };
 
   // La pieza tiene que quedarse quieta mientras el brazo la toma
+  // Antes de tomar la pieza, comprobar que el destino es alcanzable (si no,
+  // el brazo quedaría con la pieza en la garra a mitad del ciclo)
+  {
+    int tmp[NUM_SERVOS];
+    if (!calcularIK(XD, YD, Z_ALTO, PITCH_CICLO, rd, garraCerrada, tmp) ||
+        !calcularIK(XD, YD, Z_DEP,  PITCH_CICLO, rd, garraCerrada, tmp)) {
+      Serial.println(F("ERR destino inalcanzable, revisar R_D / ANG_D / Z_DEP"));
+      return false;
+    }
+  }
+
   int motorAntes = motorObjetivo;
   if (DETENER_BANDA_EN_CICLO) motorDetenerSuave();
 
@@ -428,6 +463,8 @@ void reportarEstado() {
   Serial.print(F(" motor=")); Serial.print(motorActual);
   Serial.print('/'); Serial.print(motorObjetivo);
   Serial.print(F(" duty=")); Serial.print(motorDutyDirecto);
+  Serial.print(F(" zToma=")); Serial.print(zToma);
+  Serial.print(F(" garra=")); Serial.print(garraCerrada);
   Serial.println();
 }
 
@@ -532,6 +569,18 @@ void handleCommand(String cmd) {
     }
     garraCerrada = g;
     Serial.print(F("OK garra cerrada=")); Serial.println(garraCerrada);
+    return;
+  }
+
+  if (letra == 'Z') {
+    if (!esEntero(resto)) { Serial.println(F("ERR formato, usar: Z mm")); return; }
+    int z = resto.toInt();
+    if (z < 0 || z > Z_ALTO - 10) {
+      Serial.print(F("ERR debe estar entre 0 y ")); Serial.println((int)(Z_ALTO - 10));
+      return;
+    }
+    zToma = z;
+    Serial.print(F("OK altura de agarre=")); Serial.println(zToma);
     return;
   }
 

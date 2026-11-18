@@ -50,6 +50,10 @@ HSV_ALTO    = [179, 50, 255]
 
 # --- Modo automático (banda + brazo) ---
 BAUDIOS        = 115200
+# Corrección fija [mm] que se suma a la posición medida (marco del robot).
+# Usarla solo si el error de agarre es SIEMPRE el mismo en toda la zona.
+# Ej.: la garra cae 20 mm antes de la pieza (le falta x) -> (20.0, 0.0).
+CORRECCION_XY  = (0.0, 0.0)
 VEL_BANDA      = 10          # [%] velocidad de la banda (comando M), el signo da el sentido
                              #     duty real = 80 + (VEL-1)*175/99  ->  30 % ≈ 131/255
 # Zona donde se toman las piezas, en mm en el marco del robot:
@@ -62,7 +66,7 @@ ZONA_TOMA      = None
 ALCANCE_MIN    = 60.0        # [mm] distancia mínima del centro de la base
 ALCANCE_MAX    = 232.0       # [mm] distancia máxima para frenar la banda
 MARGEN_MEDIR   = 6.0         # [mm] al medir se acepta hasta ALCANCE_MAX + esto (límite real 239)
-DESTINO_XY     = (85.0, -147.0)   # igual que XD, YD del firmware
+DESTINO_XY     = (68.4, 187.9)    # igual que XD, YD del firmware (R_D=200, ANG_D=70)
 RADIO_DESTINO  = 70.0        # [mm] se ignoran piezas cerca del destino (las ya colocadas)
 ESPERA_FRENADO = 0.8         # [s] después de M0, antes de empezar a medir
 N_ESTABLE      = 5           # lecturas seguidas casi iguales para aceptar la pose
@@ -270,6 +274,8 @@ def pose_pieza(contorno, esquinas, H):
     if abs(M["m00"]) < 1e-9:
         return None
     cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
+    cx += CORRECCION_XY[0]
+    cy += CORRECCION_XY[1]
     ext, inte = a_mundo(H, np.array(esquinas))
     phi = 0#math.degrees(math.atan2(inte[1] - ext[1], inte[0] - ext[0]))
     return cx, cy, phi
