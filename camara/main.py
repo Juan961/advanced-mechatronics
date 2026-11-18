@@ -40,7 +40,7 @@ except ImportError:
     msvcrt = None
 
 # ========================= CONFIGURACIÓN =========================
-IP_CAMARA   = "10.12.122.212"                       # la IP que imprime el ESP32-CAM al arrancar
+IP_CAMARA   = "192.168.4.1"                        # fija con la cámara en modo AP (su propia red)
 URL_STREAM  = f"http://{IP_CAMARA}:81/stream"
 URL_CAPTURA = f"http://{IP_CAMARA}/capture"          # respaldo si el stream falla
 ARCHIVO_CAL = Path(__file__).with_name("calibracion_camara.json")   # junto a este script
@@ -84,15 +84,15 @@ class Camara:
         base_url = f"http://{ip_camara.strip().rstrip('/') }"
         self.url_stream = f"{base_url}:81/stream"
         self.url_captura = f"{base_url}/capture"
-        self.cap = cv2.VideoCapture(self.url_stream)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.usar_stream = self.cap.isOpened()
         self._frame = None
         self._id = 0            # contador de cuadros recibidos
         self._id_leido = 0      # último cuadro entregado por leer()
         self._cond = threading.Condition()
-        if self.usar_stream:
-            threading.Thread(target=self._hilo_stream, daemon=True).start()
+        self.cap = self._abrir_stream()
+        self.usar_stream = self.cap is not None
+        # El hilo corre siempre: si el stream se cae, lo vuelve a abrir solo
+        # (mientras tanto leer() usa /capture)
+        threading.Thread(target=self._hilo_stream, daemon=True).start()
         if not self.usar_stream:
             try:
                 urllib.request.urlopen(self.url_captura, timeout=3).close()
@@ -105,15 +105,39 @@ class Camara:
                 raise SystemExit(1)
             print("Stream no disponible, se usará /capture (más lento).")
 
+    def _abrir_stream(self):
+        """Abre el stream con timeouts cortos (por defecto FFmpeg espera ~30 s
+        cuando el Wi-Fi se traba). Devuelve el VideoCapture o None."""
+        cap = cv2.VideoCapture(self.url_stream, cv2.CAP_FFMPEG,
+                               [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
+                                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000])
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
     def _hilo_stream(self):
         fallos = 0
-        while self.usar_stream:
+        cuadros, t_fps = 0, time.time()
+        while True:
+            if self.cap is None:                     # caído: reintentar
+                time.sleep(1.0)
+                self.cap = self._abrir_stream()
+                if self.cap is not None:
+                    print("Stream recuperado.")
+                    self.usar_stream = True
+                    fallos = 0
+                continue
+
             ok, frame = self.cap.read()
             if not ok:
                 fallos += 1
-                if fallos > 50:
-                    print("Stream perdido, se usará /capture (más lento).")
+                if fallos > 10:
+                    print("Stream perdido, reconectando (mientras tanto /capture, más lento)...")
                     self.usar_stream = False
+                    self.cap.release()
+                    self.cap = None
                 time.sleep(0.02)
                 continue
             fallos = 0
@@ -121,6 +145,15 @@ class Camara:
                 self._frame = frame
                 self._id += 1
                 self._cond.notify_all()
+
+            # Aviso si el stream va lento (casi siempre es señal Wi-Fi débil)
+            cuadros += 1
+            dt = time.time() - t_fps
+            if dt >= 5.0:
+                fps = cuadros / dt
+                if fps < 8:
+                    print(f"AVISO: stream lento, {fps:.1f} cuadros/s (revisa la señal Wi-Fi de la cámara)")
+                cuadros, t_fps = 0, time.time()
 
     def leer(self):
         """Devuelve el cuadro más reciente que todavía no se haya entregado

@@ -11,8 +11,21 @@
 // Enter your WiFi credentials
 
 // ===========================
-const char *ssid = "AC";
-const char *password = "abcardillas";
+const char *ssid = "JJ";
+const char *password = "elcoditofc";
+
+// true: la cámara CREA su propia red con ese nombre y contraseña (IP fija
+//       192.168.4.1). Apagar el hotspot del celular para que la PC no se
+//       confunda entre las dos redes con el mismo nombre.
+// false: se conecta como cliente a una red existente (hotspot / router).
+const bool MODO_AP = true;
+// Canal Wi-Fi (1, 6 u 11). En la universidad el 6 está ocupado ~62 % y el 1
+// ~80 %; el 11 estaba en ~32 %. Si sigue lento, probar los otros.
+const int  CANAL_AP = 11;
+// Potencia de transmisión en modo AP. La PC está cerca: con menos potencia la
+// placa pide picos de corriente más chicos (menos caídas de voltaje).
+// Si la PC está lejos y se corta, subir a WIFI_POWER_15dBm o WIFI_POWER_19_5dBm.
+const wifi_power_t POTENCIA_AP = WIFI_POWER_11dBm;
 
 void startCameraServer();
 void setupLedFlash();
@@ -41,7 +54,9 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  // 10 MHz en vez de 20: el reloj de la cámara mete menos ruido en la radio
+  // Wi-Fi de la ESP32-CAM (en QVGA sigue dando de sobra cuadros por segundo)
+  config.xclk_freq_hz = 10000000;
   config.frame_size = FRAMESIZE_UXGA;
   config.pixel_format = PIXFORMAT_JPEG;  // for streaming
   //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
@@ -92,6 +107,9 @@ void setup() {
   // drop down frame size for higher initial frame rate
   if (config.pixel_format == PIXFORMAT_JPEG) {
     s->set_framesize(s, FRAMESIZE_QVGA);
+    // 10..63: número más alto = JPEG más liviano. 15 se ve casi igual que 10 y
+    // pesa bastante menos, así el stream aguanta mejor cuando la señal está floja.
+    s->set_quality(s, 15);
   }
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
@@ -108,25 +126,45 @@ void setup() {
   setupLedFlash();
 #endif
 
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
+  if (MODO_AP) {
+    // La cámara crea su propia red (mismo nombre y contraseña de arriba).
+    // La PC se conecta directo a ella; la cámara queda siempre en 192.168.4.1.
+    WiFi.mode(WIFI_AP);
+    // máx. 1 equipo conectado: así el celular u otra PC no le roba ancho de banda
+    if (!WiFi.softAP(ssid, password, CANAL_AP, 0, 1)) {
+      Serial.println("ERROR: no se pudo crear la red (la contraseña debe tener 8+ caracteres)");
+      return;
+    }
+    WiFi.setSleep(false);
+    WiFi.setTxPower(POTENCIA_AP);
+    Serial.println("Red Wi-Fi propia creada");
+  } else {
+    WiFi.begin(ssid, password);
+    WiFi.setSleep(false);
 
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+    Serial.print("WiFi connecting");
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println("");
+    Serial.println("WiFi connected");
   }
-  Serial.println("");
-  Serial.println("WiFi connected");
 
   startCameraServer();
 
   Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
+  Serial.print(MODO_AP ? WiFi.softAPIP() : WiFi.localIP());
   Serial.println("' to connect");
 }
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
+  // El servidor web corre en otra tarea. Aquí solo se reporta el estado del Wi-Fi.
+  if (MODO_AP) {
+    Serial.printf("Equipos conectados a la red de la camara: %d\n", WiFi.softAPgetStationNum());
+  } else {
+    //   > -60 dBm buena, -60..-70 aceptable, < -70 dBm el stream se va a trabar.
+    Serial.printf("WiFi RSSI: %d dBm\n", WiFi.RSSI());
+  }
   delay(10000);
 }
