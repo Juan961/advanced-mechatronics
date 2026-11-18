@@ -321,8 +321,11 @@ def modo_plano(ip_camara):
     cv2.namedWindow("Plano")
     cv2.setMouseCallback("Plano", al_clic)
     pts_img, pts_mm = [], []
+    confirmar = False       # 2.º 'c' guarda aunque haya puntos con error grande
     print("Haz clic en un punto de referencia y escribe sus coordenadas en la consola.")
-    print("Mínimo 4 puntos, que no estén en línea. 'c' calcula y guarda, 'q' sale.")
+    print("Marco del ROBOT: x hacia adelante, y hacia la IZQUIERDA del robot (mm).")
+    print("Usa 6 o más puntos repartidos, que no estén en línea.")
+    print("'u' deshace el último punto, 'c' calcula y guarda, 'q' sale sin guardar.")
     while True:
         vista = frame.copy()
         for (u, v), (xm, ym) in zip(pts_img, pts_mm):
@@ -340,8 +343,34 @@ def modo_plano(ip_camara):
                 pts_mm.append((xm, ym))
             except ValueError:
                 print("Formato inválido, usa por ejemplo: 150,80")
-        if k == ord("c") and len(pts_img) >= 4:
+        if k == ord("u") and pts_img:
+            print(f"Deshecho el punto {pts_img.pop()} -> {pts_mm.pop()}")
+        if k == ord("c"):
+            if len(pts_img) < 4:
+                print(f"Faltan puntos: hay {len(pts_img)}, se necesitan al menos 4.")
+                continue
             H, _ = cv2.findHomography(np.float32(pts_img), np.float32(pts_mm))
+            if H is None:
+                print("No se pudo calcular: revisa que los puntos no estén en línea.")
+                continue
+            # Error de cada punto: con 6+ puntos un número mal escrito se nota acá
+            est = a_mundo(H, pts_img)
+            print("\nError de cada punto (calibración vs lo que escribiste):")
+            peor = 0.0
+            for (u, v), (xm, ym), (xe, ye) in zip(pts_img, pts_mm, est):
+                e = math.hypot(xe - xm, ye - ym)
+                peor = max(peor, e)
+                marca = "  <-- revisar" if e > 5 else ""
+                print(f"  píxel ({u:3},{v:3})  escrito ({xm:6.1f},{ym:6.1f})  "
+                      f"calculado ({xe:6.1f},{ye:6.1f})  error {e:4.1f} mm{marca}")
+            if len(pts_img) == 4:
+                print("  (con solo 4 puntos el error siempre da 0: no se puede verificar)")
+            elif peor > 5:
+                print("  Hay puntos con más de 5 mm de error: 'u' para quitarlos y volver a marcar,")
+                print("  o 'c' otra vez para guardar igual.")
+                if not confirmar:
+                    confirmar = True
+                    continue
             cal["H"] = H.tolist()
             guardar_cal(cal)
             break
